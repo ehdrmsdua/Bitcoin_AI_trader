@@ -1,0 +1,39 @@
+import ccxt
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+
+# binance API set
+exchange = ccxt.binance({
+    'apiKey': 'your_api_key',
+    'secret': 'your_api_secret_key',
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'future'
+    }
+})
+
+symbol = 'BTC/USDT'
+timeframe = '1h'
+
+#You can adjust this time parameter. (If you want to retrieve data from 100 hours ago to the present, set hours=100)
+hours_delta = timedelta(hours=100) 
+since_time = datetime.utcnow() - hours_delta
+since = exchange.parse8601(since_time.isoformat() + 'Z')
+all_candles = []
+
+# Get data
+while since < exchange.milliseconds():
+    candles = exchange.fetch_ohlcv(symbol, timeframe, since)
+    if not candles:
+        break
+    last_time = candles[-1][0]
+    all_candles += candles
+    since = last_time + 1
+    time.sleep(exchange.rateLimit / 10000) 
+    
+df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+#Insert your file path
+df.to_csv(r"insert_your_file_path.csv", index=False)
