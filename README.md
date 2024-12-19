@@ -11,7 +11,8 @@ Run the code and follow the on-screen instructions.<br/>
 1. Enter the trade volume (in USDT).<br/>
 2. Set the leverage level.<br/>
 3. Configure the stop loss (input as a ratio between 0 and 1).<br/>
-<br/>
+
+
 ### Basic Logic (Classification):<br/>
 - Every hour, the code fetches 1-hour interval chart data.<br/>
 - The data is scaled using a scaler from the specified path, and predictions are made using the model in the same path.<br/>
