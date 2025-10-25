@@ -1,10 +1,4 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[ ]:
-
-
-# Classification (PyTorch 버전)
+# Classification (XGBoost 버전)
 import ccxt
 import pandas as pd
 import numpy as np
@@ -12,21 +6,20 @@ from datetime import datetime, timedelta
 import time
 import threading
 from joblib import load
-import torch
-import torch.nn as nn
+import xgboost as xgb
 
-# ========= 사용자 설정 =========
-API_KEY ='input_your_api_key'
+# ===== 사용자 설정 =====
+API_KEY = 'input_your_api_key'
 API_SECRET = 'input_your_api_secret_key'
 
-# 모델 설정
-MODEL_TYPE = 'torchscript'  # 'torchscript' 또는 'state_dict'
-MODEL_PATH = r"C:\Users\admin\Desktop\model_epoch_4k_150_24_82.pt"  # TorchScript(.pt) 기준
-LOOK_BACK = 24
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '1h'
+LOOK_BACK = 1
 
-SCALER_PATH = r"C:\Users\admin\Desktop\coinScale\4k_scaler.save"  # StandardScaler
-
-# ========= 바이낸스 연결 =========
+# XGBoost 분류기 모델과 스케일러 경로
+XGB_MODEL_PATH =
+SCALER_PATH =
+# ===== 거래소 연결 =====
 binance = ccxt.binance({
     'apiKey': API_KEY,
     'secret': API_SECRET,
@@ -34,81 +27,36 @@ binance = ccxt.binance({
     'options': {'defaultType': 'future'}
 })
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ========= (선택) state_dict 모델 구조 정의 =========
-# state_dict로 저장했다면 아래 클래스의 hidden_size, num_layers 등을 학습 때와 동일하게 맞추고
-# MODEL_TYPE='state_dict' 로 바꿔서 사용하세요.
-class SimpleLSTM(nn.Module):
-    def __init__(self, input_size=4, hidden_size=64, num_layers=1, dropout=0.0):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=input_size,
-                            hidden_size=hidden_size,
-                            num_layers=num_layers,
-                            batch_first=True,
-                            dropout=dropout if num_layers > 1 else 0.0)
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        # x: (B, T, F)
-        out, _ = self.lstm(x)
-        last = out[:, -1, :]          # (B, H)
-        logits = self.fc(last)         # (B, 1)
-        prob = torch.sigmoid(logits)   # (B, 1) -> 0~1
-        return prob
-
-# ========= 모델/스케일러 로드 =========
-def load_model_pytorch():
-    if MODEL_TYPE == 'torchscript':
-        model = torch.jit.load(MODEL_PATH, map_location=device)
-        model.eval()
-        return model
-    else:
-        # state_dict로 저장된 경우 (경로는 MODEL_PATH)
-        model = SimpleLSTM(input_size=4, hidden_size=64, num_layers=1, dropout=0.0).to(device)
-        state = torch.load(MODEL_PATH, map_location=device)
-        # state가 {'state_dict': ...} 형태면 state['state_dict']로 로드
-        if isinstance(state, dict) and 'state_dict' in state:
-            state = state['state_dict']
-        model.load_state_dict(state, strict=True)
-        model.eval()
-        return model
-
-model = load_model_pytorch()
+# ===== 모델/스케일러 로드 =====
+clf = xgb.XGBClassifier()
+clf.load_model(XGB_MODEL_PATH)
 scaler = load(SCALER_PATH)
 
-# ========= 런타임 상태 =========
+# ===== 런타임 상태 =====
 input_queue = []
+current_position = None        # 'long' / 'short' / None
 open_position_price = None
-current_position = None  # 'long' / 'short' / None
 
-# ========= 유틸 =========
+# ===== 유틸 =====
 def round_amount(symbol, amount):
-    """마켓 최소 수량/자리수 맞춰 반올림. 최소 수량 미만이면 보정."""
+    """거래소 최소 수량·자리수에 맞춰 보정"""
     market = binance.market(symbol)
     prec = market['precision']['amount']
     min_qty = market.get('limits', {}).get('amount', {}).get('min', None)
 
     if prec is not None:
         amount = float(f"{amount:.{prec}f}")
-
     if min_qty is not None and amount < float(min_qty):
         amount = float(f"{float(min_qty):.{prec}f}") if prec is not None else float(min_qty)
-
     return amount
 
 def set_stop_loss(symbol, position_size, last_price, is_long, stop_loss):
-    if is_long:
-        stop_price = last_price * (1 - stop_loss)
-        side = 'SELL'
-    else:
-        stop_price = last_price * (1 + stop_loss)
-        side = 'BUY'
-
+    stop_price = last_price * (1 - stop_loss) if is_long else last_price * (1 + stop_loss)
+    side = 'SELL' if is_long else 'BUY'
     params = {
         'stopPrice': stop_price,
-        'closePosition': True
-        # 'reduceOnly': True,  # 필요시 활성화
+        'closePosition': True,   # 전량 청산
+        # 'reduceOnly': True,    # 필요 시 활성화
     }
     binance.create_order(symbol, 'STOP_MARKET', side, position_size, None, params)
     print(f"Set stop-loss at {stop_price}")
@@ -116,12 +64,12 @@ def set_stop_loss(symbol, position_size, last_price, is_long, stop_loss):
 def get_position_size(symbol):
     sym_raw = symbol.replace("/", "")
     positions = binance.fapiPrivateV2GetPositionRisk({'symbol': sym_raw})
-    position_size = 0.0
+    pos = 0.0
     for p in positions:
         if p['symbol'] == sym_raw:
-            position_size = abs(float(p['positionAmt']))
+            pos = abs(float(p['positionAmt']))
             break
-    return position_size
+    return pos
 
 def cancel_stop_loss_orders(symbol):
     try:
@@ -135,117 +83,113 @@ def cancel_stop_loss_orders(symbol):
 
 def close_position(symbol, last_price):
     global current_position, open_position_price
-    position_size = get_position_size(symbol)
-    if position_size <= 0:
+    size = get_position_size(symbol)
+    if size <= 0:
         print("No position to close.")
         current_position = None
         open_position_price = None
         return
 
     if current_position == 'long':
-        profit_loss = (last_price - open_position_price) * position_size
-        binance.create_market_sell_order(symbol, position_size, params={'reduceOnly': True})
+        pl = (last_price - open_position_price) * size
+        binance.create_market_sell_order(symbol, size, params={'reduceOnly': True})
     elif current_position == 'short':
-        profit_loss = (open_position_price - last_price) * position_size
-        binance.create_market_buy_order(symbol, position_size, params={'reduceOnly': True})
+        pl = (open_position_price - last_price) * size
+        binance.create_market_buy_order(symbol, size, params={'reduceOnly': True})
     else:
-        profit_loss = 0.0
+        pl = 0.0
 
-    print(f"Profit/Loss: {profit_loss} USDT")
+    print(f"Profit/Loss: {pl} USDT")
     current_position = None
     open_position_price = None
 
-def get_input(input_queue):
+def get_input(q):
     while True:
         try:
-            inp = input()
-            input_queue.append(inp)
+            q.append(input())
         except EOFError:
             break
 
-# ========= 예측 및 트레이딩 =========
+# ===== 예측 및 트레이딩 =====
 def predict_and_trade(amount_in_usdt, leverage, stop_loss):
     global current_position, open_position_price
 
-    symbol = 'BTC/USDT'
-    timeframe = '1h'
     limit = 20 + LOOK_BACK
-
     since_time = datetime.utcnow() - timedelta(hours=limit)
     since = binance.parse8601(since_time.isoformat() + 'Z')
 
-    candles = binance.fetch_ohlcv(symbol, timeframe, since, limit=limit)
+    candles = binance.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit=limit)
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
+    # 특징: close, returns, high, low
     df['returns'] = df['close'].pct_change().fillna(0.0)
-    feats = df[['close', 'returns', 'high', 'low']].values[-LOOK_BACK:]
+    window = df[['close', 'returns', 'high', 'low']].values[-LOOK_BACK:]
 
-    # 스케일링
-    feats_scaled = scaler.transform(feats).astype(np.float32)
-    x = torch.from_numpy(feats_scaled).unsqueeze(0).to(device)  # (1, T, F)
+    # 스케일링 후 평탄화 → XGB 입력
+    window_scaled = scaler.transform(window)              # (LOOK_BACK, 4)
+    x_input = window_scaled.flatten().reshape(1, -1)      # (1, LOOK_BACK*4)
 
-    # 예측 (0~1 확률)
-    with torch.no_grad():
-        y = model(x)
-        if isinstance(y, (list, tuple)):
-            y = y[0]
-        prob_up = float(y.squeeze().detach().cpu().item())
+    # 상승 확률
+    if hasattr(clf, "predict_proba"):
+        prob_up = float(clf.predict_proba(x_input)[0][1])
+    else:
+        score = float(clf.decision_function(x_input)[0])
+        prob_up = 1.0 / (1.0 + np.exp(-score))
     print(f"Predicted prob(up): {prob_up:.6f}")
 
     last_price = float(df['close'].iloc[-1])
     total_usdt_with_leverage = amount_in_usdt * leverage
     amount_in_coin = total_usdt_with_leverage / last_price
-    amount_in_coin = round_amount(symbol, amount_in_coin)
+    amount_in_coin = round_amount(SYMBOL, amount_in_coin)
 
-    now = datetime.now()
     threshold = 0.5
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 롱 진입
     if prob_up > threshold and current_position != 'long':
-        print("time:", now.strftime("%Y-%m-%d %H:%M:%S"))
+        print("time:", now)
         if current_position == 'short':
-            close_position(symbol, last_price)
-            cancel_stop_loss_orders(symbol)
+            close_position(SYMBOL, last_price)
+            cancel_stop_loss_orders(SYMBOL)
             open_position_price = last_price
         else:
             open_position_price = last_price
 
-        print(f"Going long with {amount_in_coin} {symbol}")
-        binance.create_market_buy_order(symbol, amount_in_coin)
+        print(f"Going long with {amount_in_coin} {SYMBOL}")
+        binance.create_market_buy_order(SYMBOL, amount_in_coin)
         current_position = 'long'
-        set_stop_loss(symbol, amount_in_coin, last_price, True, stop_loss)
+        set_stop_loss(SYMBOL, amount_in_coin, last_price, True, stop_loss)
 
+    # 숏 진입
     elif prob_up <= threshold and current_position != 'short':
-        print("time:", now.strftime("%Y-%m-%d %H:%M:%S"))
+        print("time:", now)
         if current_position == 'long':
-            close_position(symbol, last_price)
-            cancel_stop_loss_orders(symbol)
+            close_position(SYMBOL, last_price)
+            cancel_stop_loss_orders(SYMBOL)
             open_position_price = last_price
         else:
             open_position_price = last_price
 
-        print(f"Going short with {amount_in_coin} {symbol}")
-        binance.create_market_sell_order(symbol, amount_in_coin)
+        print(f"Going short with {amount_in_coin} {SYMBOL}")
+        binance.create_market_sell_order(SYMBOL, amount_in_coin)
         current_position = 'short'
-        set_stop_loss(symbol, amount_in_coin, last_price, False, stop_loss)
+        set_stop_loss(SYMBOL, amount_in_coin, last_price, False, stop_loss)
 
-# ========= 메인 =========
+# ===== 메인 루프 =====
 def main():
-    # 입력
     amount_in_usdt = int(input("Enter your amount - USDT: "))
     leverage = int(input("Enter your leverage: "))
     stop_loss = float(input("Enter your stop_loss: "))  # 예: 0.02
 
-    # 입력 스레드 (q 입력 시 종료)
-    input_thread = threading.Thread(target=get_input, args=(input_queue,))
-    input_thread.daemon = True
-    input_thread.start()
+    t = threading.Thread(target=get_input, args=(input_queue,))
+    t.daemon = True
+    t.start()
 
     while True:
         if input_queue and input_queue[-1] == 'q':
             print("Program is exiting...")
             break
-
         current_time = datetime.utcnow()
         wait_time = 3600 - (current_time.minute * 60 + current_time.second)
         print("waiting...\n")
@@ -254,4 +198,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
